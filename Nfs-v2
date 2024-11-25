@@ -1,0 +1,197 @@
+import os
+import subprocess
+import json
+import nmap
+import ipaddress
+import shutil
+import logging
+from datetime import datetime
+
+# Configuração do logger
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Função para validar o endereço IP
+def validate_ip(ip):
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        logging.error("Endereço IP inválido.")
+        return False
+
+# Função para verificar se a porta 2049 está aberta
+def check_port(ip):
+    logging.info("Verificando a porta 2049...")
+    nm = nmap.PortScanner()
+    try:
+        nm.scan(ip, '2049', arguments='--host-timeout 30s')
+        if nm[ip].has_tcp(2049) and nm[ip]['tcp'][2049]['state'] == 'open':
+            logging.info("Porta 2049 está aberta.")
+            return True
+        else:
+            logging.warning("Porta 2049 está fechada.")
+            return False
+    except Exception as e:
+        logging.error(f"Erro ao verificar a porta 2049: {e}")
+        return False
+
+# Função para listar compartilhamentos
+def list_shares(ip):
+    logging.info("Listando compartilhamentos NFS...")
+    try:
+        result = subprocess.check_output(["showmount", "-e", ip], stderr=subprocess.STDOUT)
+        shares = result.decode().strip().split("\n")[1:]
+        shares_dict = [line.split()[0] for line in shares]
+        logging.info(f"Compartilhamentos encontrados: {shares_dict}")
+        return shares_dict
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Erro ao listar compartilhamentos: {e.output.decode()}")
+        return []
+
+# Função para analisar vulnerabilidades de um compartilhamento
+def check_vulnerabilities(ip, share):
+    vulnerabilities = []
+    logging.info(f"Analisando vulnerabilidades no compartilhamento {share}...")
+    try:
+        result = subprocess.check_output(["showmount", "-e", ip], stderr=subprocess.STDOUT).decode()
+        for line in result.split("\n"):
+            if share in line:
+                permissions = line.split()[-1]
+                if permissions == "*":
+                    vulnerabilities.append("Acesso irrestrito: Qualquer host pode montar este compartilhamento.")
+                elif "0.0.0.0" in permissions or "any" in permissions:
+                    vulnerabilities.append("Acesso amplo configurado: Permissão para todos os hosts.")
+        if not vulnerabilities:
+            logging.info(f"Nenhuma vulnerabilidade óbvia detectada em {share}.")
+    except Exception as e:
+        logging.error(f"Erro ao analisar vulnerabilidades: {e}")
+        vulnerabilities.append(f"Erro ao analisar: {str(e)}")
+    return vulnerabilities
+
+# Função para montar e analisar permissões
+def analyze_share(ip, share):
+    mount_dir = f"/tmp/nfs_mount_{share.replace('/', '_')}"
+    os.makedirs(mount_dir, exist_ok=True)
+    logging.info(f"Montando o compartilhamento {share} em {mount_dir}...")
+    try:
+        subprocess.check_call(["sudo", "mount", "-t", "nfs", f"{ip}:{share}", mount_dir])
+        logging.info("Compartilhamento montado com sucesso.")
+
+        # Listar conteúdo e permissões
+        logging.info("Analisando conteúdo e permissões...")
+        file_info = subprocess.check_output(["ls", "-lR", mount_dir]).decode()
+
+        # Verificar vulnerabilidades
+        vulnerabilities = check_vulnerabilities(ip, share)
+
+        return {"share": share, "mount_point": mount_dir, "content": file_info, "vulnerabilities": vulnerabilities}
+    except subprocess.CalledProcessError as e:
+        error_message = f"Erro ao montar o compartilhamento {share}: {e}"
+        logging.error(error_message)
+        return {"share": share, "mount_point": mount_dir, "error": error_message}
+    finally:
+        subprocess.call(["sudo", "umount", mount_dir])
+        shutil.rmtree(mount_dir, ignore_errors=True)
+
+def test_privilege_escalation(mount_dir):
+    logging.info(f"Testando escalada de privilégios no diretório {mount_dir}...")
+    escalation_issues = []
+    try:
+        # Verificar arquivos com SUID ou SGID
+        suid_files = subprocess.check_output(["find", mount_dir, "-perm", "-4000"]).decode().strip()
+        if suid_files:
+            escalation_issues.append(f"Arquivos com SUID encontrados: {suid_files}")
+
+        # Testar criação de arquivos
+        test_file = os.path.join(mount_dir, "test_file")
+        with open(test_file, "w") as f:
+            f.write("Teste de escrita")
+        escalation_issues.append("Permissão de escrita encontrada.")
+        os.remove(test_file)
+    except Exception as e:
+        logging.error(f"Erro ao testar escalada de privilégios: {e}")
+        escalation_issues.append(f"Erro ao testar: {str(e)}")
+    return escalation_issues
+
+
+
+
+def check_advanced_vulnerabilities(ip, share):
+    vulnerabilities = []
+    logging.info(f"Analisando configurações avançadas do compartilhamento {share}...")
+    try:
+        result = subprocess.check_output(["showmount", "-e", ip], stderr=subprocess.STDOUT).decode()
+        for line in result.split("\n"):
+            if share in line:
+                if "no_root_squash" in line:
+                    vulnerabilities.append("Configuração insegura: no_root_squash habilitado.")
+                if share == "/":
+                    vulnerabilities.append("Risco alto: Diretório raiz exportado.")
+    except Exception as e:
+        logging.error(f"Erro ao verificar configurações avançadas: {e}")
+        vulnerabilities.append(f"Erro ao analisar: {str(e)}")
+    return vulnerabilities
+
+
+
+
+
+def nfs_nse_scan(ip):
+    logging.info("Executando varredura de vulnerabilidades conhecidas com Nmap NSE...")
+    try:
+        result = subprocess.check_output(
+            ["nmap", "-p", "2049", "--script", "nfs-ls,nfs-statfs,nfs-showmount", ip]
+        ).decode()
+        return result
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Erro ao executar Nmap NSE: {e}")
+        return None
+
+
+
+
+
+
+# Função principal
+def main(ip):
+    if not validate_ip(ip):
+        return
+
+    # Verificação de permissões de root
+    if os.geteuid() != 0:
+        logging.error("Este script precisa ser executado como root.")
+        exit(1)
+
+    report = {"target": ip, "scanned_at": datetime.now().isoformat(), "shares": []}
+
+    # Verificar a porta 2049
+    if not check_port(ip):
+        return
+
+    # Listar compartilhamentos
+    shares = list_shares(ip)
+    if not shares:
+        return
+
+    # Analisar cada compartilhamento
+    for share in shares:
+        analysis = analyze_share(ip, share)
+        report["shares"].append(analysis)
+
+    # Salvar relatório em JSON
+    output_file = f"nfs_report_{ip.replace('.', '_')}.json"
+    with open(output_file, "w") as f:
+        json.dump(report, f, indent=4)
+    logging.info(f"Relatório salvo em {output_file}")
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Script avançado para explorar serviços NFS e analisar vulnerabilidades.")
+    parser.add_argument("ip", help="Endereço IP do alvo")
+    args = parser.parse_args()
+
+    try:
+        main(args.ip)
+    except Exception as e:
+        logging.error(f"Erro inesperado: {e}")
